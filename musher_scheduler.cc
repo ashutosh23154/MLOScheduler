@@ -1,41 +1,47 @@
+// This is throughput and not goodput.
+// If packet size is 1000 bytes, the mpdu size is coming as 1038 bytes. So, the overhead is 38 bytes.
+// In the beginning of the simulation, some 28 bytes acknowledgement packets are also received.
+// Although scheduler is independent of AC, but it's logic is based on TID to link mapping. So, if AC are changed, mapping and other things should be checked.
+// PacketSocketClient can send only two TIDs. So, in this example, TID 0 is mapped to Link 0 and TID 3 is mapped to Link 1. We can't have more than two TIDs.
+// Changing the p_tid3 is not making any difference. It should be checked
+
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/multi-model-spectrum-channel.h"
 #include "ns3/network-module.h"
-#include "ns3/packet-socket.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/rng-seed-manager.h"
 #include "ns3/ssid.h"
+#include "ns3/wifi-co-trace-helper.h"
 #include "ns3/wifi-module.h"
 #include "ns3/yans-wifi-helper.h"
-#include "ns3/wifi-mac-header.h"
-#include "ns3/socket.h" // For SocketPriorityTag
+#include "ns3/packet-socket.h"
+#include "ns3/socket.h" 
 
+#include <algorithm>
+#include <cassert>
+#include <fstream>
 #include <iomanip>
-#include <iostream>
-#include <string>
 #include <map>
+#include <iostream>
+#include <fstream>
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("ThroughputSchedulerExample");
+NS_LOG_COMPONENT_DEFINE("MLD_FEEDBACK");
 
-// --------------------------------------------------------------------------------
-// 1. GLOBAL DATA STRUCTURES
-// --------------------------------------------------------------------------------
-// Global map to store latest throughput [nodeId -> [linkId -> throughput Mbps]]
 std::map<uint32_t, std::map<uint8_t, double>> g_throughputMap;
-// Map to store received bytes during a calculation period [nodeId -> [linkId -> bytes]]
 std::map<uint32_t, std::map<uint8_t, uint64_t>> g_bytesReceived;
-// Utility map to resolve MAC address to Node ID
 std::map<Mac48Address, uint32_t> g_macToNodeId;
-// TID-to-Link mapping knowledge: TID 0 -> Link 0, TID 3 -> Link 1
 std::map<uint16_t, uint8_t> g_tidToLinkMap = {{0, 0}, {3, 1}};
 
-/**
- * A helper function that configures an uplink flow.
- */
+// Add these with your other global variables
+std::map<uint32_t, std::map<uint8_t, uint64_t>> g_totalBytesReceived;
+std::map<uint32_t, Time> g_flowStartTimes;
+std::map<uint32_t, Time> g_flowLastAckTimes;
+
 Ptr<PacketSocketClient>
 GetClientApplication(const PacketSocketAddress& sockAddr,
                      const std::size_t pktSize,
@@ -49,9 +55,9 @@ GetClientApplication(const PacketSocketAddress& sockAddr,
     client->SetAttribute("MaxPackets", UintegerValue(0));
     client->SetAttribute("Interval", TimeValue(interval));
 
-    /* Tid 0 & 3 are AC_BE. We use them to route to Link 0 and Link 1. */
-    client->SetAttribute("Priority", UintegerValue(0));    // Corresponds to TID 0
-    client->SetAttribute("OptionalTid", UintegerValue(3)); // Corresponds to TID 3
+    auto tid1 = UintegerValue(0), tid2 = UintegerValue(3);
+    client->SetAttribute("Priority", tid1);
+    client->SetAttribute("OptionalTid", tid2);
     client->SetAttribute("OptionalTidPr", DoubleValue(p_tid3));
 
     client->SetRemote(sockAddr);
@@ -60,9 +66,52 @@ GetClientApplication(const PacketSocketAddress& sockAddr,
     return client;
 }
 
-/**
- * A helper function that enables tid-to-link mapping on a node.
- */
+void
+UpdateThroughputMap(Time period)
+{
+    std::ofstream outFile("throughput_with_scheduler.csv", std::ios::app);
+    for (auto const& [nodeId, linkMap] : g_bytesReceived)
+    {
+        for (auto const& [linkId, bytes] : linkMap)
+        {
+            double throughputMbps = (bytes * 8.0) / (period.GetSeconds() * 1e6);
+            g_throughputMap[nodeId][linkId] = throughputMbps;
+            outFile << Simulator::Now().GetSeconds() << ","
+                    << nodeId << ","
+                    << (int)linkId << ","
+                    << throughputMbps << std::endl;
+            NS_LOG_INFO(Simulator::Now().GetSeconds()
+                        << "s, Update: Node " << nodeId << ", Link " << (int)linkId
+                        << ", Throughput: " << throughputMbps << " Mbps");
+        }
+    }
+    g_bytesReceived.clear();
+    Simulator::Schedule(period, &UpdateThroughputMap, period);
+}
+
+void
+MusherScheduler(Ptr<Node> sta, Ptr<PacketSocketClient> client, Time periodicity)
+{
+    uint32_t nodeId = sta->GetId();
+    double tp_link0 = g_throughputMap.count(nodeId) && g_throughputMap[nodeId].count(0)
+                          ? g_throughputMap[nodeId][0]
+                          : 0.0;
+    double tp_link1 = g_throughputMap.count(nodeId) && g_throughputMap[nodeId].count(1)
+                          ? g_throughputMap[nodeId][1]
+                          : 0.0;
+
+    double total_tp = tp_link0 + tp_link1;
+    double p_tid3 = (total_tp > 0) ? (tp_link1 / total_tp) : 0.5;
+
+    client->SetAttribute("OptionalTidPr", DoubleValue(p_tid3));
+
+    NS_LOG_INFO(Simulator::Now().GetSeconds()
+                << "s, Scheduler: Node " << nodeId << ", TP(L0/L1): " << tp_link0 << "/"
+                << tp_link1 << " Mbps. Set new split ratio for Link 1 (p_tid3) to: " << p_tid3);
+
+    Simulator::Schedule(periodicity, &MusherScheduler, sta, client, periodicity);
+}
+
 void
 ConfigureTidToLinkMapping(NetDeviceContainer devices, std::string mapping)
 {
@@ -79,106 +128,6 @@ ConfigureTidToLinkMapping(NetDeviceContainer devices, std::string mapping)
     }
 }
 
-// --------------------------------------------------------------------------------
-// 2. THROUGHPUT MONITORING CALLBACK (AT AP)
-// --------------------------------------------------------------------------------
-/**
- * This callback is connected to the Rx trace of the AP's PacketSocketServer.
- * It inspects every received packet to log bytes per node, per link.
- */
-
-void
-RxCallback(Ptr<const Packet> packet, const Address& from)
-{
-    PacketSocketAddress socketAddress = PacketSocketAddress::ConvertFrom(from);
-    Mac48Address fromMac = Mac48Address::ConvertFrom(socketAddress.GetPhysicalAddress());
-    if (g_macToNodeId.count(fromMac))
-    {
-        uint32_t nodeId = g_macToNodeId[fromMac];
-        SocketPriorityTag priorityTag;
-        if (packet->PeekPacketTag(priorityTag))
-        {
-            NS_LOG_INFO("Received packet from Node " << nodeId
-                                                      << " with priority tag: "
-                                                      << priorityTag.GetPriority());
-            // The priority set by the client is equivalent to the TID for our mapping.
-            uint16_t tid = priorityTag.GetPriority(); 
-            if (g_tidToLinkMap.count(tid))
-            {
-                uint8_t linkId = g_tidToLinkMap[tid];
-                g_bytesReceived[nodeId][linkId] += packet->GetSize();
-            }
-        } 
-        // else {
-        //     NS_LOG_INFO("Received packet from Node " << nodeId
-        //                                               << " without priority tag");
-        // }
-    }
-}
-
-// --------------------------------------------------------------------------------
-// 3. PERIODIC THROUGHPUT CALCULATOR
-// --------------------------------------------------------------------------------
-/**
- * This function is scheduled periodically to calculate throughput from the
- * collected byte counts and update the global throughput map.
- */
-void
-UpdateThroughputMap(Time period)
-{
-    for (auto const& [nodeId, linkMap] : g_bytesReceived)
-    {
-        for (auto const& [linkId, bytes] : linkMap)
-        {
-            double throughputMbps = (bytes * 8.0) / (period.GetSeconds() * 1e6);
-            g_throughputMap[nodeId][linkId] = throughputMbps;
-            NS_LOG_INFO(Simulator::Now().GetSeconds()
-                        << "s, Update: Node " << nodeId << ", Link " << (int)linkId
-                        << ", Throughput: " << throughputMbps << " Mbps");
-        }
-    }
-    // Reset the byte counter for the next interval
-    g_bytesReceived.clear();
-    // Reschedule the next update
-    Simulator::Schedule(period, &UpdateThroughputMap, period);
-}
-
-// --------------------------------------------------------------------------------
-// 4. THE "MUSHER-LIKE" SCHEDULER (AT STA)
-// --------------------------------------------------------------------------------
-/**
- * Periodically adjusts the traffic split-ratio for a STA based on the
- * throughput values in the global map.
- */
-void
-MusherScheduler(Ptr<Node> sta, Ptr<PacketSocketClient> client, Time periodicity)
-{
-    uint32_t nodeId = sta->GetId();
-    // Get throughput for link 0 and link 1 from the global map
-    double tp_link0 = g_throughputMap.count(nodeId) && g_throughputMap[nodeId].count(0)
-                          ? g_throughputMap[nodeId][0]
-                          : 0.0;
-    double tp_link1 = g_throughputMap.count(nodeId) && g_throughputMap[nodeId].count(1)
-                          ? g_throughputMap[nodeId][1]
-                          : 0.0;
-
-    double total_tp = tp_link0 + tp_link1;
-    // Probability for Optional TID (TID 3 -> Link 1) is proportional to link 1's throughput
-    double p_tid3 = (total_tp > 0) ? (tp_link1 / total_tp) : 0.5; // Default to 50/50 split
-
-    client->SetAttribute("OptionalTidPr", DoubleValue(p_tid3));
-
-    NS_LOG_INFO(Simulator::Now().GetSeconds()
-                << "s, Scheduler: Node " << nodeId << ", TP(L0/L1): " << tp_link0 << "/"
-                << tp_link1 << " Mbps. Set new split ratio for Link 1 (p_tid3) to: " << p_tid3);
-
-    // Reschedule the next scheduler decision
-    Simulator::Schedule(periodicity, &MusherScheduler, sta, client, periodicity);
-}
-
-/**
- * Install Packet Socket Server on a node.
- */
 void
 InstallPacketSocketServer(Ptr<Node> node, Time startAfter, Time stopAfter)
 {
@@ -191,13 +140,8 @@ InstallPacketSocketServer(Ptr<Node> node, Time startAfter, Time stopAfter)
     node->AddApplication(psServer);
     psServer->SetStartTime(startAfter);
     psServer->SetStopTime(stopAfter);
-    // Connect our RxCallback to the server's Rx trace
-    psServer->TraceConnectWithoutContext("Rx", MakeCallback(&RxCallback));
 }
 
-/**
- * Install packet socket client that generates an uplink flow on a node.
- */
 Ptr<PacketSocketClient>
 InstallPacketSocketClient(Ptr<Node> client,
                           Ptr<Node> server,
@@ -205,7 +149,11 @@ InstallPacketSocketClient(Ptr<Node> client,
                           Time startAfter,
                           Time stopAfter)
 {
+    NS_LOG_INFO("Start Flow on node:" << client->GetId() << " at:" << Simulator::Now()
+                                  << " with load:" << loadInMbps << " Mbps");
+
     Ptr<WifiNetDevice> staDevice = DynamicCast<WifiNetDevice>(client->GetDevice(0));
+
     PacketSocketAddress sockAddr;
     sockAddr.SetSingleDevice(staDevice->GetIfIndex());
     sockAddr.SetPhysicalAddress(server->GetDevice(0)->GetAddress());
@@ -214,14 +162,17 @@ InstallPacketSocketClient(Ptr<Node> client,
     size_t packetSizeInBytes = 1000;
     double packetInterval = packetSizeInBytes * 8.0 / loadInMbps;
 
+    double p_tid3 = 0.5;
     auto clientApp = GetClientApplication(sockAddr,
-                                          packetSizeInBytes,
+                                          1000,
                                           MicroSeconds(packetInterval),
                                           startAfter,
-                                          stopAfter);
-    client->AddApplication(clientApp);
+                                          stopAfter,
+                                          p_tid3);
+    staDevice->GetNode()->AddApplication(clientApp);
     return clientApp;
 }
+
 
 void
 DisableAggregation(NodeContainer nodes)
@@ -231,42 +182,120 @@ DisableAggregation(NodeContainer nodes)
         for (uint32_t j = 0; j < nodes.Get(i)->GetNDevices(); j++)
         {
             auto device = DynamicCast<WifiNetDevice>(nodes.Get(i)->GetDevice(j));
-            if (!device) continue;
+            if (!device)
+            {
+                continue;
+            }
+
             device->GetMac()->SetAttribute("BE_MaxAmpduSize", UintegerValue(0));
+            device->GetMac()->SetAttribute("BK_MaxAmpduSize", UintegerValue(0));
+            device->GetMac()->SetAttribute("VO_MaxAmpduSize", UintegerValue(0));
+            device->GetMac()->SetAttribute("VI_MaxAmpduSize", UintegerValue(0));
         }
     }
 }
 
 void
-AddPriorityTag(Ptr<const Packet> pkt, WifiMacHeader const &hdr)
+AckedMpduCallback(Ptr<const WifiMpdu> mpdu)
 {
-    // Check if the tag already exists to avoid duplicate tags
-    SocketPriorityTag tag;
-    NS_LOG_INFO("Adding priority tag to packet");
-    if (!pkt->PeekPacketTag(tag)) {
-        // For example, choose TID based on a per-node or per-app logic
-        // Here, as an example: use TID 0 for even STAs, TID 3 for odd STAs
-        uint16_t tid = (hdr.GetQosTid() == 0) ? 0 : 3;
-        tag.SetPriority(tid);
-        pkt->AddPacketTag(tag);
+    if (!mpdu->GetHeader().IsData() || mpdu->GetHeader().GetAddr1().IsGroup())
+    {
+        return;
+    }
+
+    Mac48Address senderMac = mpdu->GetHeader().GetAddr2();
+
+    if (g_macToNodeId.count(senderMac))
+    {
+        uint32_t nodeId = g_macToNodeId[senderMac];
+        std::set<uint8_t> links = mpdu->GetInFlightLinkIds();
+        uint32_t mpduSize = mpdu->GetSize();
+
+        g_flowLastAckTimes[nodeId] = Simulator::Now();
+
+        if (!links.empty())
+        {
+            // This is the normal case for a correctly identified MLO frame.
+            for (auto const& linkId : links)
+            {
+                // NS_LOG_INFO(Simulator::Now().GetSeconds()
+                //             << "s, AckedMpdu (MLO): Node " << nodeId << ", Link " << (int)linkId
+                //             << ", MPDU size: " << mpduSize << " bytes");
+                g_bytesReceived[nodeId][linkId] += mpduSize;
+                g_totalBytesReceived[nodeId][linkId] += mpduSize;
+            }
+        }
+        else
+        {
+            // FALLBACK: This is a non-MLO frame. Check its TID to determine the intended link.
+            if (mpdu->GetHeader().IsQosData())
+            {
+                uint8_t tid = mpdu->GetHeader().GetQosTid();
+                if (g_tidToLinkMap.count(tid))
+                {
+                    uint8_t linkId = g_tidToLinkMap.at(tid);
+                    // NS_LOG_INFO(Simulator::Now().GetSeconds()
+                    //             << "s, AckedMpdu (non-MLO Fallback): Node " << nodeId << ", Link " << (int)linkId
+                    //             << " (from TID " << (int)tid << "), MPDU size: " << mpduSize << " bytes");
+                    g_bytesReceived[nodeId][linkId] += mpduSize;
+                    g_totalBytesReceived[nodeId][linkId] += mpduSize;
+                }
+            }
+        }
     }
 }
 
-/**
- * Main simulation setup.
- */
+void
+PrintFinalResults()
+{
+    std::cout << "\n----------------------------------------------------" << std::endl;
+    std::cout << "---           Final Simulation Results           ---" << std::endl;
+    std::cout << "----------------------------------------------------" << std::endl;
+
+    for (auto const& [nodeId, linkMap] : g_totalBytesReceived)
+    {
+        uint64_t totalBytesForNode = 0;
+        for (auto const& [linkId, bytes] : linkMap)
+        {
+            totalBytesForNode += bytes;
+        }
+
+        Time startTime = g_flowStartTimes[nodeId];
+        Time lastTime = g_flowLastAckTimes[nodeId];
+        
+        if (lastTime <= startTime) continue; // Avoid division by zero if no packets were acked
+
+        Time duration = lastTime - startTime;
+        double throughputMbps = (totalBytesForNode * 8.0) / (duration.GetSeconds() * 1e6);
+
+        std::cout << "Node " << nodeId << ":" << std::endl;
+        std::cout << "  - Total Bytes Received: " << totalBytesForNode << std::endl;
+        std::cout << "  - Flow Duration:        " << duration.GetSeconds() << " s" << std::endl;
+        std::cout << "  - Average Throughput:   " << throughputMbps << " Mbps" << std::endl;
+        std::cout << std::endl;
+    }
+}
+
 int
 main(int argc, char* argv[])
 {
-    LogComponentEnable("ThroughputSchedulerExample", LOG_LEVEL_INFO);
+    std::ofstream("throughput_with_scheduler.csv").close();
+    LogComponentEnable("MLD_FEEDBACK", LOG_LEVEL_INFO);
+
+    NS_LOG_INFO("[logs]: Simulation started");
     RngSeedManager::SetSeed(3);
     RngSeedManager::SetRun(2);
 
     Time m_start{Seconds(1.0)};
-    Time m_stop{Seconds(10.0)};
+    Time m_stop{Seconds(20.0)};
+
     size_t nWifi{4};
+    std::string coTraceFile{"/tmp/ns3_co.csv"};
 
     CommandLine cmd(__FILE__);
+
+    cmd.AddValue("coTraceFile", "Path of channel occupancy trace file", coTraceFile);
+
     cmd.Parse(argc, argv);
 
     NodeContainer ap;
@@ -281,108 +310,115 @@ main(int argc, char* argv[])
 
     WifiMacHelper mac;
     Ssid ssid = Ssid("ns-3-ssid");
+
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211be);
 
+    // Create multiple spectrum channels
     Ptr<MultiModelSpectrumChannel> spectrumChannel5Ghz = CreateObject<MultiModelSpectrumChannel>();
     Ptr<MultiModelSpectrumChannel> spectrumChannel6Ghz = CreateObject<MultiModelSpectrumChannel>();
 
     SpectrumWifiPhyHelper phy(2);
+    phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
     phy.AddChannel(spectrumChannel5Ghz, WIFI_SPECTRUM_5_GHZ);
     phy.AddChannel(spectrumChannel6Ghz, WIFI_SPECTRUM_6_GHZ);
 
+    // configure operating channel for each link
     phy.Set(0, "ChannelSettings", StringValue("{0, 40, BAND_5GHZ, 0}"));
     phy.Set(1, "ChannelSettings", StringValue("{0, 40, BAND_6GHZ, 0}"));
-    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+
+    // configure rate manager for each link
+    wifi.SetRemoteStationManager(1,
+                                 "ns3::ConstantRateWifiManager",
                                  "DataMode",
-                                 StringValue("EhtMcs11"));
+                                 StringValue("EhtMcs11"),
+                                 "ControlMode",
+                                 StringValue("OfdmRate24Mbps"));
+    uint8_t linkId = 0;
+    wifi.SetRemoteStationManager(linkId,
+                                 "ns3::ConstantRateWifiManager",
+                                 "DataMode",
+                                 StringValue("EhtMcs11"),
+                                 "ControlMode",
+                                 StringValue("OfdmRate24Mbps"));
 
     mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
-    // mac.SetType("ns3::ApWifiMac",
-    //         "Ssid", SsidValue(ssid),
-    //         "QosSupported", BooleanValue(true));  // <-- added
     NetDeviceContainer ap_devices = wifi.Install(phy, mac, ap);
 
     mac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(ssid), "ActiveProbing", BooleanValue(false));
-    // mac.SetType("ns3::StaWifiMac",
-    //         "Ssid", SsidValue(ssid),
-    //         "QosSupported", BooleanValue(true),   // <-- added
-    //         "ActiveProbing", BooleanValue(false));
     NetDeviceContainer sta_devices = wifi.Install(phy, mac, sta);
 
+    NetDeviceContainer m_devices;
+    m_devices.Add(ap_devices);
+    m_devices.Add(sta_devices);
+
+    // Replace the entire mobility block with this:
     MobilityHelper mobility;
     Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-    positionAlloc->Add(Vector(0.0, 0.0, 0.0));
-    auto distance = 0.1;
-    positionAlloc->Add(Vector(distance, 0.0, 0.0));
+    positionAlloc->Add(Vector(0.0, 0.0, 0.0)); // AP at the origin
+    double distance = 5.0; // Start STAs 5 meters away from the AP
+    for (size_t i = 0; i < nWifi; ++i)
+    {
+        // Place STAs at (5,0,0), (6,0,0), etc. to give them unique positions
+        positionAlloc->Add(Vector(distance + i, 0.0, 0.0));
+    }
     mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    // mobility.SetPositionAllocator("ns3::GridPositionAllocator",
-    //                               "MinX",
-    //                               DoubleValue(1.0),
-    //                               "MinY",
-    //                               DoubleValue(1.0),
-    //                               "DeltaX",
-    //                               DoubleValue(1.0),
-    //                               "DeltaY",
-    //                               DoubleValue(1.0),
-    //                               "GridWidth",
-    //                               UintegerValue(5),
-    //                               "LayoutType",
-    //                               StringValue("RowFirst"));
-    // mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(m_nodes);
 
-    /* TID 0 maps to link 0; TIDs 1-7 map to link 1. We use TID 0 and TID 3. */
     std::string mldMapping = "0 0; 1,2,3,4,5,6,7 1";
-    ConfigureTidToLinkMapping(ap_devices, mldMapping);
-    ConfigureTidToLinkMapping(sta_devices, mldMapping);
-
-    // InternetStackHelper stack;
-    // stack.Install(m_nodes);
+    ConfigureTidToLinkMapping(m_devices, mldMapping);
 
     DisableAggregation(m_nodes);
+    int gi = 800;
     Config::Set("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/HeConfiguration/GuardInterval",
-                TimeValue(NanoSeconds(800)));
+                TimeValue(NanoSeconds(gi)));
 
     PacketSocketHelper packetSocket;
     packetSocket.Install(m_nodes);
 
+    // AFTER (in main function, after InstallPacketSocketServer call)
     InstallPacketSocketServer(ap.Get(0), m_start, m_stop);
 
-    // Populate the MAC-to-NodeID map for easy lookup in the RxCallback
     for (uint32_t i = 0; i < sta.GetN(); ++i)
     {
         Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(sta.Get(i)->GetDevice(0));
         g_macToNodeId[dev->GetMac()->GetAddress()] = sta.Get(i)->GetId();
-    }
-
-    for (uint32_t i = 0; i < sta.GetN(); ++i)
-    {
-        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(sta.Get(i)->GetDevice(0));
-        dev->GetMac()->TraceConnectWithoutContext("Tx", MakeCallback(&AddPriorityTag));
+        for (uint8_t linkId = 0; linkId < dev->GetMac()->GetNLinks(); ++linkId)
+        {
+            Mac48Address linkAddress = dev->GetMac()->GetFrameExchangeManager(linkId)->GetAddress();
+            g_macToNodeId[linkAddress] = sta.Get(i)->GetId();
+            // NS_LOG_INFO("Mapping Node " << sta.Get(i)->GetId() << ", Link " << (int)linkId << " MAC " << linkAddress);
+        }
+        dev->GetMac()->TraceConnectWithoutContext("AckedMpdu", MakeCallback(&AckedMpduCallback));
     }
 
     Time schedulerPeriodicity = Seconds(0.25);
-    // Schedule the first call to the throughput calculator
     Simulator::Schedule(m_start + schedulerPeriodicity, &UpdateThroughputMap, schedulerPeriodicity);
 
-    std::vector<double> loads{10.0, 7.0, 7.0, 6.0};
+    std::vector<double> loads{8.0, 8.0, 8.0, 8.0};
+
     for (size_t i = 1; i <= nWifi; i++)
     {
-        Time startTime = i * Seconds(2.0);
+        // Time startTime = i * Seconds(2.0);
+        Time startTime = m_start + Seconds((i - 1) * 0.5);
+        // Time startTime = m_start;
+
+        g_flowStartTimes[sta.Get(i - 1)->GetId()] = startTime;
+
         auto clientApp =
             InstallPacketSocketClient(sta.Get(i - 1), ap.Get(0), loads.at(i - 1), startTime, m_stop);
 
-        // Schedule the Musher scheduler for this client to start and run periodically
-        Simulator::Schedule(startTime,
+        Simulator::Schedule(startTime + schedulerPeriodicity,
                             &MusherScheduler,
                             sta.Get(i - 1),
                             clientApp,
                             schedulerPeriodicity);
-    }
+    }   
 
-    Simulator::Stop(m_stop + Seconds(1.0));
+    Simulator::Schedule(m_stop, &PrintFinalResults);
+
+    Simulator::Stop(m_stop);
     Simulator::Run();
     Simulator::Destroy();
 
